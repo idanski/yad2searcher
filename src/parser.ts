@@ -1,4 +1,4 @@
-import type { Page } from "playwright";
+import type { Page } from "patchright";
 import type { ParsedListing } from "./types";
 import { parsePrice, extractItemId } from "./utils";
 
@@ -9,7 +9,7 @@ export async function parseListingDetails(
 
   try {
     const banner = await page
-      .waitForSelector('div[class*="ad-seen-count-banner_adAttractivenessBox"]', { timeout: 3000 })
+      .waitForSelector('div[class*="ad-seen-count-banner"]', { timeout: 3000 })
       .catch(() => null);
     if (banner) {
       const text = (await banner.textContent()) ?? "";
@@ -21,7 +21,7 @@ export async function parseListingDetails(
     }
 
     const dateEl = await page
-      .waitForSelector('span[class*="report-ad_createdAt"]', { timeout: 3000 })
+      .waitForSelector('[data-testid="report-ad-label"]', { timeout: 3000 })
       .catch(() => null);
     if (dateEl) {
       const dateText = (await dateEl.textContent()) ?? "";
@@ -40,11 +40,19 @@ export async function parseListingDetails(
       }
     }
 
-    // Parse amenities from the page
-    const pageText = await page.evaluate(() => document.body.innerText);
-    result.hasBalcony = pageText.includes("מרפסת");
-    result.hasElevator = pageText.includes("מעלית");
-    result.hasShelter = pageText.includes("ממ\"ד") || pageText.includes("ממ״ד");
+    // Parse amenities — prefer the structured grid, fall back to text search
+    const amenityGrid = await page.$('[data-testid="in-property-grid"]');
+    if (amenityGrid) {
+      const gridText = ((await amenityGrid.textContent()) ?? "").toLowerCase();
+      result.hasBalcony = gridText.includes("מרפסת");
+      result.hasElevator = gridText.includes("מעלית");
+      result.hasShelter = gridText.includes('ממ"ד') || gridText.includes("ממ״ד");
+    } else {
+      const pageText = await page.evaluate(() => document.body.innerText);
+      result.hasBalcony = pageText.includes("מרפסת");
+      result.hasElevator = pageText.includes("מעלית");
+      result.hasShelter = pageText.includes('ממ"ד') || pageText.includes("ממ״ד");
+    }
 
     // Wait for gallery section and images to render
     const gallerySection = await page
@@ -52,12 +60,11 @@ export async function parseListingDetails(
       .catch(() => null);
 
     if (gallerySection) {
-      // Scroll gallery into view to trigger lazy-loaded images
       await gallerySection.scrollIntoViewIfNeeded().catch(() => {});
       await new Promise((r) => setTimeout(r, 1500));
 
       const imageUrls = await page.$$eval(
-        '[data-testid="item-gallery-section"] li:not([class*="mobile-only"]) img[data-testid="image"]',
+        '[data-testid="item-gallery-section"] img[data-testid="image"]',
         (imgs) =>
           (imgs as HTMLImageElement[])
             .map((img) => img.src || img.dataset.src || "")
@@ -88,9 +95,9 @@ export async function parseListingDetails(
       }
     }
 
-    // Extract publisher name — broker listings use a data-testid, private listings use a class
-    const brokerNameEl = await page.$('span[data-testid="agency-ad-contact-info-name"]');
-    const privateNameEl = await page.$('span[class*="ad-contact-info_name"]');
+    // Extract publisher name — broker listings use a data-testid, private listings use a data-testid or class fallback
+    const brokerNameEl = await page.$('[data-testid="agency-ad-contact-info-name"]');
+    const privateNameEl = await page.$('[data-testid="ad-contact-info-name"]') ?? await page.$('span[class*="ad-contact-info_name"]');
     const nameEl = brokerNameEl ?? privateNameEl;
     if (nameEl) {
       const name = ((await nameEl.textContent()) ?? "").trim();

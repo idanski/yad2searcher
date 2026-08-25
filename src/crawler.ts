@@ -1,11 +1,8 @@
 import path from "path";
-import { chromium } from "playwright-extra";
-import type { BrowserContext, Page } from "playwright";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import { chromium } from "patchright";
+import type { BrowserContext, Page } from "patchright";
 import { AppConfig } from "./types";
-import { randomUserAgent, randomViewport, randomSleep, randomInt } from "./utils";
-
-chromium.use(StealthPlugin());
+import { randomViewport, randomSleep, randomInt, randomUserAgent } from "./utils";
 
 export class Crawler {
   private config: AppConfig;
@@ -38,48 +35,10 @@ export class Crawler {
       },
     });
 
-    // Inject anti-detection scripts before any page loads
-    await this.context.addInitScript(() => {
-      // Hide webdriver
-      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-
-      // Realistic plugins array
-      Object.defineProperty(navigator, "plugins", {
-        get: () => {
-          const plugins = [
-            { name: "Chrome PDF Plugin", filename: "internal-pdf-viewer", description: "Portable Document Format" },
-            { name: "Chrome PDF Viewer", filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai", description: "" },
-            { name: "Native Client", filename: "internal-nacl-plugin", description: "" },
-          ];
-          (plugins as any).length = 3;
-          return plugins;
-        },
-      });
-
-      // Realistic languages
-      Object.defineProperty(navigator, "languages", { get: () => ["he-IL", "he", "en-US", "en"] });
-
-      // Chrome runtime
-      (window as any).chrome = {
-        runtime: {
-          connect: () => {},
-          sendMessage: () => {},
-        },
-      };
-
-      // Permissions API
-      const originalQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
-      window.navigator.permissions.query = (parameters: any) => {
-        if (parameters.name === "notifications") {
-          return Promise.resolve({ state: Notification.permission } as PermissionStatus);
-        }
-        return originalQuery(parameters);
-      };
-    });
-
     this.page = this.context.pages()[0] || await this.context.newPage();
 
-    console.log("[crawler] browser launched with anti-detection measures");
+    const browserVersion = await this.page.evaluate(() => navigator.userAgent).catch(() => "unknown");
+    console.log(`[crawler] browser launched — UA: ${browserVersion}`);
   }
 
   async navigateToSearch(url: string): Promise<void> {
@@ -88,39 +47,53 @@ export class Crawler {
     }
 
     const maxRetries = 4;
-    // Backoff: 30s, 60s, 120s, then give up
     const backoffMs = [30_000, 60_000, 120_000];
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       console.log(`[crawler] navigating to: ${url} (attempt ${attempt}/${maxRetries})`);
-      await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await this.page.goto(url, { waitUntil: "networkidle", timeout: 60_000 });
+
+      // Give Radware challenge JS time to resolve
+      await new Promise((r) => setTimeout(r, 5000));
+
+      const pageTitle = await this.page.title().catch(() => "unknown");
+      const pageUrl = this.page.url();
+      console.log(`[crawler] page title: "${pageTitle}" | URL: ${pageUrl}`);
+
+      // Dump first 500 chars of HTML for debugging
+      const htmlSnippet = await this.page.evaluate(() => document.documentElement.outerHTML.slice(0, 500)).catch(() => "could not read");
+      console.log(`[crawler] HTML snippet: ${htmlSnippet}`);
 
       try {
-        await this.page.waitForSelector('ul[data-testid="feed-list"]', { timeout: 20000 });
+        // Wait for the Radware challenge to resolve and the real Next.js page to swap in.
+        await this.page.waitForSelector("#__NEXT_DATA__", { state: "attached", timeout: 30_000 });
+        console.log("[crawler] challenge resolved, Next.js page loaded");
+
+        // Now wait for the feed list to render
+        await this.page.waitForSelector('ul[data-testid="feed-list"]', { timeout: 15_000 });
         await this.performMouseMovements();
         console.log("[crawler] search page loaded successfully");
         return;
       } catch {
         const screenshotPath = path.join(process.cwd(), `debug-attempt-${attempt}.png`);
         await this.page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
-        const pageTitle = await this.page.title().catch(() => "unknown");
-        const isCaptcha = pageTitle.toLowerCase().includes("captcha") || pageTitle.includes("ShieldSquare");
-        console.warn(`[crawler] feed list not found (attempt ${attempt}/${maxRetries}) — ${isCaptcha ? "CAPTCHA detected" : `page: "${pageTitle}"`}`);
+        const isCaptcha = pageTitle.toLowerCase().includes("captcha") || pageTitle.includes("ShieldSquare") || pageTitle.includes("Radware");
+        console.warn(`[crawler] page did not load (attempt ${attempt}/${maxRetries}) — ${isCaptcha ? "CAPTCHA/Challenge detected" : `page: "${pageTitle}"`}`);
         console.warn(`[crawler] screenshot saved to: ${screenshotPath}`);
 
         if (attempt < maxRetries) {
           const waitMs = backoffMs[attempt - 1];
           console.log(`[crawler] backing off ${waitMs / 1000}s before retry...`);
           await new Promise((r) => setTimeout(r, waitMs));
-          await this.page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+          await this.page.reload({ waitUntil: "networkidle", timeout: 60_000 }).catch(() => {});
+          await new Promise((r) => setTimeout(r, 5000));
         }
       }
     }
 
-    // CAPTCHA persists across runs via the browser profile — wipe it so the next run starts clean
     const fs = await import("fs");
     fs.rmSync(this.config.browserDataDir, { recursive: true, force: true });
-    console.warn(`[crawler] cleared browser data at ${this.config.browserDataDir} to reset CAPTCHA state`);
+    console.warn(`[crawler] cleared browser data at ${this.config.browserDataDir} to reset state`);
 
     throw new Error("Failed to load feed list after all retries — possible anti-bot block. Browser data has been cleared for next run.");
   }
@@ -143,7 +116,6 @@ export class Crawler {
       return false;
     }
 
-    // Check if the button is actually enabled (disabled on last page)
     const isDisabled = await nextButton.evaluate(
       (el) => el.hasAttribute("aria-disabled") || el.classList.contains("disabled") || (el as HTMLButtonElement).disabled
     );
@@ -152,7 +124,6 @@ export class Crawler {
       return false;
     }
 
-    // Also check the current page text to detect last page
     const paginationText = await this.page.$eval(
       'span[class*="textVariant"]',
       (el) => el.textContent || ""
@@ -192,7 +163,6 @@ export class Crawler {
       await new Promise((r) => setTimeout(r, randomInt(100, 500)));
     }
 
-    // Optional small scroll
     if (Math.random() > 0.5) {
       await this.page.mouse.wheel(0, randomInt(100, 300));
     }
@@ -204,7 +174,7 @@ export class Crawler {
     }
 
     console.log(`[crawler] navigating to listing: ${url}`);
-    await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
     await this.page.waitForSelector('h1[data-testid="heading"]', { timeout: 10000 });
     await this.performMouseMovements();
     console.log("[crawler] listing page loaded successfully");
