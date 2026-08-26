@@ -8,7 +8,7 @@ COPY src/ ./src/
 RUN npm run build
 
 # Stage 2: Runtime
-FROM mcr.microsoft.com/playwright:v1.52.0-noble
+FROM mcr.microsoft.com/playwright:v1.59.1-noble
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
